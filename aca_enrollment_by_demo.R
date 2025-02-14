@@ -9,9 +9,20 @@ library(cli)
 library(furrr)
 library(future)
 library(haven)
+library(survey)
+library(srvyr)
 
 # No scientific notation
 options(scipen = 999)
+
+# Set options to deal with lonely PSUs. A PSU is a Primary Sampling Unit. Primary Sampling Units are divided among several sampling strata. The MEPS survey design package provides appropriate sampling weights for each strata in order for each sampling unit to be re-weighted in proportion to the POI (Population of Interest - in this case, the entire US).
+# In some cases, our analysis might necessitate drilling down to very small subpopulations, which will whittle down the membership of some strata to 1 or fewer members. In this case, we might encounter some strata with a single member - a "lonely PSU" - at which point the Survey package will error out when computing the sample variance to determine the standard error for a particular statistic (mean, total sum, etc.). Setting this option will adjust the data in the single-PSU stratum so that it is centered at the entire sample mean instead of the particular stratum mean, which tends to be a more conservative computation of the variance and has the effect of contributing to a wider standard error estimate for any statistic of interest in the analysis.
+
+# In short, the following line will conservatively re-center certain data points so that a standard error for statistics of interest (mean, total sum, etc.) is computable for all strata - even those containing a single PSU, with the tradeoff of a larger (and more conservative) magnitude of standard error.
+# An excellent article that goes into more detail about this process (and expresses some concern about the magnitude of overconservatism that R's survey package employs in re-centering the lonely PSU mean) can be read here:
+# https://www.practicalsignificance.com/posts/bugs-with-singleton-strata/
+
+options(survey.lonely.psu='adjust')
 
 # This R Script utilizes a custom MEPS package maintained by Emily Mitchell (AHRQ)
 # to retrieve MEPS data files that contain key demographic, truncated ICD-10-CM, and 
@@ -147,3 +158,70 @@ fyc_data_pooled <- fyc_datasets %>%
                                AGEYYX >= 70 & AGEYYX < 80 ~ "70 - 79",
                                AGEYYX >= 80 ~ "80 and over",
                                .default = "N/A"))
+
+# First prepare a summary of exposure months by cateogry above, plus DUPERSID and meps_year
+fyc_data_exposures <- fyc_data_pooled %>% 
+  select(DUPERSID, meps_year, matches("^(PRI|PEG|PNG|POG|PRX|MCR|MCD|INS)[A-Z]{2}YY$")) %>% 
+  pivot_longer(
+    cols = -c(DUPERSID,meps_year),
+    names_to = c("Source", "Month"),
+    names_pattern = "(\\w{3})(\\w{2})",
+    values_to = "Enrolled"
+  ) %>% 
+  mutate(Enrolled = !as.logical(Enrolled - 1)) %>% 
+  pivot_wider(names_from = "Source", values_from = "Enrolled") %>% 
+  mutate(OTH = (!MCR & !PRI & !MCD & INS),
+         SLF = !INS) %>% 
+  relocate(OTH, .before=INS) %>% 
+  rename(PRV=PRI,
+         TOT=INS) %>% 
+  pivot_longer(cols = -c(DUPERSID, meps_year, Month),
+               names_to = "Source",
+               values_to = "Enrolled") 
+
+# Summarize month-by-month enrollment with a count of expos by member, meps_year, and coverage type
+fyc_data_expos_totals <- fyc_data_exposures %>% 
+  group_by(DUPERSID, meps_year, Source) %>% 
+  summarize(Expos = sum(Enrolled)) %>% 
+  ungroup() 
+
+# Define cohort with at least two months on the private exchange plan
+prx_cohort <- fyc_data_expos_totals %>% 
+  filter(Source=="PRX") %>% 
+  select(DUPERSID, meps_year, prx_mmos=Expos) %>% 
+  mutate(in_prx_plan=prx_mmos > 0)
+
+# Bring in this cohort flag to the larger dataset for constructing estimates
+fyc_pooled_prx <- fyc_data_pooled %>% 
+  left_join(prx_cohort, join_by(DUPERSID, meps_year)) 
+
+# Get estimated total counts by race/eth, over time, 2016 - 2022
+svydsn_by_year <- fyc_pooled_prx %>% 
+  group_by(meps_year) %>% 
+  nest() %>% 
+  ungroup() %>% 
+  mutate(svydsn = map(data, ~as_survey_design(
+    .data = .x,
+    id = VARPSU,
+    strata = VARSTR,
+    weights = PERWTYYF,
+    nest = T
+  ))) %>% 
+  select(-data) 
+
+enrlmt_by_raceth <- function(x) {
+  data <- x %>% 
+    srvyr::filter(in_prx_plan) %>% 
+    srvyr::group_by(RACETHX_DSC) %>% 
+    srvyr::summarize(pct = srvyr::survey_prop()) %>% 
+    as_tibble()
+  
+  return(data)
+}
+  
+enrlmt_by_year_raceth.data <- svydsn_by_year %>% 
+  mutate(data = map(svydsn, enrlmt_by_raceth)) %>% 
+  select(-svydsn) %>% 
+  unnest(data)
+
+
